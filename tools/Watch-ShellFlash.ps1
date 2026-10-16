@@ -251,7 +251,10 @@ function ConvertFrom-ProcessEvent($Record) {
 
 function Get-LiveProcess([int64]$Id) {
     $p = Get-CimInstance Win32_Process -Filter "ProcessId=$Id" -ErrorAction SilentlyContinue
-    if ($p) { New-ProcessRecord $p.ProcessId $p.ExecutablePath $p.CommandLine $p.ParentProcessId $null $p.CreationDate $null }
+    if (-not $p) { return }
+    $record = New-ProcessRecord $p.ProcessId $p.ExecutablePath $p.CommandLine $p.ParentProcessId $null $p.CreationDate $null
+    if (-not $p.ExecutablePath) { $record.Name = $p.Name }   # protected processes such as services.exe hide their path
+    $record
 }
 
 # The process with this ID that existed at $NotAfter (PIDs get reused, so later ones don't count).
@@ -381,6 +384,7 @@ function Get-Hints($Hit, $Chain, $Task) {
         "$how $($Task -replace '^probably ', ''). Open Task Scheduler (taskschd.msc), find it in the library and look at its Actions tab; disable it there if you don't want it."
     } else {
         $origin = $null
+        $originIndex = 0
         foreach ($p in $Chain) {
             $origin = switch ($p.Name.ToLower()) {
                 'svchost.exe' {
@@ -398,8 +402,10 @@ function Get-Hints($Hit, $Chain, $Task) {
                 'winlogon.exe' { 'your sign-in (a logon script or Run registry key)' }
             }
             if ($origin) { break }
+            $originIndex++
         }
-        if ($origin) { "Launched via $origin." }
+        if ($origin -and $originIndex -gt 0) { "Started by $($Chain[0].Name) ($($Chain[0].Path)), which was itself launched via $origin." }
+        elseif ($origin) { "Launched via $origin." }
         elseif ($Chain) { "Started by $($Chain[0].Name) ($($Chain[0].Path)): that program is the one to look at." }
         else { 'What started it could not be traced (it started before this watch and has exited). Run -Inventory to list likely candidates.' }
         if ($origin -like 'WMI*' -or $origin -like 'a WMI*') {
