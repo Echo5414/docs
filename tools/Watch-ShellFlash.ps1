@@ -377,7 +377,8 @@ function Get-ExePath([string]$CommandLine) {
     $exe
 }
 
-function Get-Hints($Hit, $Chain, $Task) {
+# $User is the account the window belongs to.
+function Get-Hints($Hit, $Chain, $Task, $User) {
     $name = $Hit.Name.ToLower()
     if ($Task) {
         if ($Task -like 'probably *') { $how = 'Most likely started by scheduled task' } else { $how = 'Started by scheduled task' }
@@ -423,24 +424,51 @@ function Get-Hints($Hit, $Chain, $Task) {
     } elseif ($name -in $ShellNames -and $Hit.CommandLine -match $UserWritable) {
         'The command line points into a user-writable folder: look at that file to see what it does.'
     }
-    if ($Hit.User -eq 'SYSTEM' -or $Hit.User -like 'NT AUTHORITY\*') {
+    if ($name -eq 'svchost.exe') {
+        if ($Hit.CommandLine -match 'DcomLaunch') { $what = "svchost.exe -k DcomLaunch is Windows' launcher for COM servers and apps: it starts programs on behalf of other programs." }
+        else { $what = 'svchost.exe only hosts Windows services.' }
+        "$what The real source is what it started at that moment (if listed) or the entries just before this one."
+    }
+    if ($User -eq 'SYSTEM' -or $User -like 'NT AUTHORITY\*') {
         'It ran under a background account, and those normally cannot show a window on your desktop: probably not the flash you saw.'
     }
 }
 
 # ---------------------------------------------------------------- reporting
 
-function Write-Hit($Hit, [string]$Note) {
+# $Console is the conhost.exe start when the hit is reported because it got a console window.
+function Write-Hit($Hit, [string]$Note, $Console) {
     $chain = @(Get-Ancestry $Hit)
     $task = Find-ScheduledTask $Hit $chain
-    $hints = @(Get-Hints $Hit $chain $task)
+    # The moment the window opened and the account it belongs to come from the conhost.exe start.
+    $when = $Hit.Time
+    $user = $Hit.User
+    $longRunning = $false
+    $startedThen = @()
+    if ($Console) {
+        $when = $Console.Time
+        if ($Console.User) { $user = $Console.User }
+        $longRunning = $Hit.Time -and ($Console.Time - $Hit.Time).TotalSeconds -gt 60
+        if ($longRunning) {
+            # E.g. a service host: what it started at that moment is the more useful lead.
+            $startedThen = @($script:Seen.Values | Where-Object {
+                $_.ParentPid -eq $Hit.Pid -and $_.Pid -ne $Console.Pid -and [Math]::Abs(($_.Time - $Console.Time).TotalSeconds) -le 3
+            } | Sort-Object Time)
+        }
+    }
+    $hints = @(Get-Hints $Hit $chain $task $user)
     $command = if ($Hit.CommandLine) { $Hit.CommandLine } else { '(not recorded)' }
 
     Write-Host ''
-    Write-Host ('[{0:yyyy-MM-dd HH:mm:ss.fff}] {1}  (pid {2}){3}' -f $Hit.Time, $Hit.Name, $Hit.Pid, $Note) -ForegroundColor Yellow
+    Write-Host ('[{0:yyyy-MM-dd HH:mm:ss.fff}] {1}  (pid {2}){3}' -f $when, $Hit.Name, $Hit.Pid, $Note) -ForegroundColor Yellow
     Write-Host "  Command : $command"
     Write-Host "  Program : $($Hit.Path)  [$((Get-FileInfo $Hit.Path).Text)]"
-    if ($Hit.User) { Write-Host "  User    : $($Hit.User)" }
+    if ($user) { Write-Host "  User    : $user" }
+    if ($longRunning) { Write-Host ('  Running : since {0:yyyy-MM-dd HH:mm:ss}; this long-running process opened the console window' -f $Hit.Time) }
+    if ($startedThen) {
+        Write-Host '  Started at that moment:'
+        foreach ($p in $startedThen) { Write-Host "    -> $($p.Name) (pid $($p.Pid))  $($p.CommandLine)" -ForegroundColor Gray }
+    }
     if ($chain) {
         Write-Host '  Started by:'
         foreach ($p in $chain) { Write-Host "    <- $($p.Name) (pid $($p.Pid))  $($p.CommandLine)" -ForegroundColor Gray }
@@ -450,18 +478,20 @@ function Write-Hit($Hit, [string]$Note) {
     if ($Beep) { [Console]::Beep(880, 150) }
 
     $row = [pscustomobject]@{
-        Time          = '{0:yyyy-MM-dd HH:mm:ss.fff}' -f $Hit.Time
+        Time          = '{0:yyyy-MM-dd HH:mm:ss.fff}' -f $when
         Program       = $Hit.Name
         Pid           = $Hit.Pid
         CommandLine   = $Hit.CommandLine
         Path          = $Hit.Path
         Publisher     = (Get-FileInfo $Hit.Path).Text
-        User          = $Hit.User
+        User          = $user
         StartedBy     = ($chain | ForEach-Object { "$($_.Name) (pid $($_.Pid)) $($_.CommandLine)" }) -join ' <- '
         ScheduledTask = $task
         Hint          = $hints -join ' '
+        StartedThen   = ($startedThen | ForEach-Object { "$($_.Name) (pid $($_.Pid)) $($_.CommandLine)" }) -join ' | '
     }
-    try { $row | Export-Csv -Path $LogPath -Append -NoTypeInformation -Encoding UTF8 }
+    # -Force: a log written by an older version of this script lacks the StartedThen column.
+    try { $row | Export-Csv -Path $LogPath -Append -NoTypeInformation -Encoding UTF8 -Force }
     catch { Write-Warning "Could not write to $LogPath (open in Excel?): $($_.Exception.Message)" }
 }
 
@@ -471,6 +501,7 @@ function Invoke-ProcessEvent($Proc, [bool]$Report) {
     $name = $Proc.Name.ToLower()
     $hit = $null
     $note = ''
+    $console = $null
     if ($All -or $name -in $ShellNames) {
         $hit = $Proc
     } elseif ($name -in $ConsoleHosts -and $Proc.CommandLine -notmatch '--headless') {
@@ -480,14 +511,19 @@ function Invoke-ProcessEvent($Proc, [bool]$Report) {
         $hit = Find-Process $Proc.ParentPid $Proc.Time
         if (-not $hit) { $hit = New-ProcessRecord $Proc.ParentPid $Proc.ParentPath '(exited before it could be looked up)' 0 $null $Proc.Time $Proc.User }
         $note = '  - opened a console window'
+        $console = $Proc
     }
     if (-not $hit) { return }
-    $script:Reported["$($hit.Pid)"] = $hit.Time
-    Write-Hit $hit $note
+    if (-not $console) { $script:Reported["$($hit.Pid)"] = $Proc.Time }   # so its own conhost.exe is not reported again
+    Write-Hit $hit $note $console
 }
 
 function Invoke-Poll {
-    foreach ($record in @(Read-NewProcessEvents)) { $script:Pending.Add((ConvertFrom-ProcessEvent $record)) }
+    foreach ($record in @(Read-NewProcessEvents)) {
+        $proc = ConvertFrom-ProcessEvent $record
+        $script:Seen["$($proc.Pid)"] = $proc   # known right away, for the "started at that moment" list
+        $script:Pending.Add($proc)
+    }
     # Handle each start ~2 s late, so that Task Scheduler's own log entry for it exists by then.
     $cutoff = (Get-Date).AddSeconds(-2)
     while ($script:Pending.Count -and $script:Pending[0].Time -le $cutoff) {
@@ -508,8 +544,10 @@ function Start-Watch {
     $history = @(Get-RecentProcessEvents ([Math]::Max($LookBackMinutes, 10)))
     if ($history.Count) { $script:Bookmark = $history[-1].Bookmark } else { $script:Bookmark = Get-NewestProcessEventBookmark }
     $reportFrom = (Get-Date).AddMinutes(-$LookBackMinutes)
-    foreach ($record in $history) {
-        Invoke-ProcessEvent (ConvertFrom-ProcessEvent $record) ($LookBackMinutes -gt 0 -and $record.TimeCreated -ge $reportFrom)
+    $procs = @($history | ForEach-Object { ConvertFrom-ProcessEvent $_ })
+    foreach ($p in $procs) { $script:Seen["$($p.Pid)"] = $p }
+    foreach ($p in $procs) {
+        Invoke-ProcessEvent $p ($LookBackMinutes -gt 0 -and $p.Time -ge $reportFrom)
     }
     if ($LookBackMinutes -gt 0) {
         Write-Host ''
